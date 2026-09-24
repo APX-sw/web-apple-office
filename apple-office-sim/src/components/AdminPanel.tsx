@@ -3,20 +3,11 @@ import { useData } from '../context/DataContext';
 import { Trash2, Plus, Save, Lock, Users, LogIn, HelpCircle, Pencil } from 'lucide-react';
 
 import Login from './Login';
-
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-const API_URL = `${BASE_URL}/api`;
-
-function getToken(): string | null {
-    return localStorage.getItem('apple_admin_token');
-}
-
-function authHeaders(): Record<string, string> {
-    return {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${getToken()}`
-    };
-}
+import {
+    BASE_URL, TOKEN_KEY, USERNAME_KEY, SESSION_EXPIRED_EVENT, SESSION_MESSAGES,
+    ApiError, apiFetch, showError, clearSession, getTokenExpiry, isTokenExpired
+} from '../lib/api';
+import type { SessionEndReason } from '../lib/api';
 
 const IPHONE_CHRONO_ORDER = [
     "iphone xr",
@@ -419,27 +410,87 @@ function AddPlanModal({
 
 // ─── Main Panel ──────────────────────────────────────────────────────────────
 
+// Cada cuánto se revisa el vencimiento del token mientras el panel está abierto.
+const SESSION_CHECK_MS = 60 * 1000;
+
 export default function AdminPanel() {
-    const [token, setToken] = useState<string | null>(() => localStorage.getItem('apple_admin_token'));
-    const [username, setUsername] = useState<string | null>(() => localStorage.getItem('apple_admin_username'));
+    // Si el token guardado ya venció, ni siquiera se muestra el panel: va derecho al login.
+    const [token, setToken] = useState<string | null>(() => {
+        const stored = localStorage.getItem(TOKEN_KEY);
+        return stored && !isTokenExpired(stored) ? stored : null;
+    });
+    const [username, setUsername] = useState<string | null>(() => localStorage.getItem(USERNAME_KEY));
+    const [sessionNotice, setSessionNotice] = useState<string | null>(() => {
+        const stored = localStorage.getItem(TOKEN_KEY);
+        return stored && isTokenExpired(stored) ? SESSION_MESSAGES['expired-on-open'] : null;
+    });
     const [activeTab, setActiveTab] = useState('base');
 
+    // Al abrir con un token vencido, limpiamos lo que quedó guardado.
+    useEffect(() => {
+        const stored = localStorage.getItem(TOKEN_KEY);
+        if (stored && isTokenExpired(stored)) clearSession();
+    }, []);
 
     const handleLogin = (newToken: string, newUsername: string) => {
-        localStorage.setItem('apple_admin_token', newToken);
-        localStorage.setItem('apple_admin_username', newUsername);
+        localStorage.setItem(TOKEN_KEY, newToken);
+        localStorage.setItem(USERNAME_KEY, newUsername);
+        setSessionNotice(null);
         setToken(newToken);
         setUsername(newUsername);
     };
 
     const handleLogout = () => {
-        localStorage.removeItem('apple_admin_token');
-        localStorage.removeItem('apple_admin_username');
+        clearSession();
         setToken(null);
         setUsername(null);
     };
 
-    // Detect token expiry on 401/403
+    // La sesión terminó sin que el usuario lo pidiera: se cierra YA y se explica por qué.
+    // Así nunca queda un panel que parece usable pero que no guarda.
+    useEffect(() => {
+        const endSession = (reason: SessionEndReason) => {
+            clearSession();
+            setSessionNotice(SESSION_MESSAGES[reason]);
+            setToken(null);
+            setUsername(null);
+        };
+
+        // 1) Un guardado fue rechazado por el servidor (401/403) o el token venció al intentarlo.
+        const onSessionEnded = (e: Event) => {
+            const reason = (e as CustomEvent<{ reason: SessionEndReason }>).detail?.reason ?? 'rejected';
+            endSession(reason);
+        };
+        window.addEventListener(SESSION_EXPIRED_EVENT, onSessionEnded);
+
+        // 2) El token vence mientras el panel está abierto: se detecta sin esperar a que guarden algo.
+        const checkExpiry = () => {
+            const stored = localStorage.getItem(TOKEN_KEY);
+            if (stored && isTokenExpired(stored)) endSession('expired-idle');
+        };
+        const interval = setInterval(checkExpiry, SESSION_CHECK_MS);
+        const onVisible = () => { if (document.visibilityState === 'visible') checkExpiry(); };
+        document.addEventListener('visibilitychange', onVisible);
+        window.addEventListener('focus', checkExpiry);
+
+        // Además, un timer exacto para el momento del vencimiento (si está a menos de ~24 días).
+        let exactTimer: ReturnType<typeof setTimeout> | undefined;
+        const stored = localStorage.getItem(TOKEN_KEY);
+        const exp = stored ? getTokenExpiry(stored) : null;
+        if (exp !== null) {
+            const ms = exp - Date.now();
+            if (ms > 0 && ms < 2_000_000_000) exactTimer = setTimeout(checkExpiry, ms + 500);
+        }
+
+        return () => {
+            window.removeEventListener(SESSION_EXPIRED_EVENT, onSessionEnded);
+            clearInterval(interval);
+            document.removeEventListener('visibilitychange', onVisible);
+            window.removeEventListener('focus', checkExpiry);
+            if (exactTimer) clearTimeout(exactTimer);
+        };
+    }, [token]);
+
     const isAdmin = !!token;
 
     if (!isAdmin) {
@@ -456,7 +507,7 @@ export default function AdminPanel() {
                         </div>
                     </div>
                 </div>
-                <Login onLogin={handleLogin} />
+                <Login onLogin={handleLogin} notice={sessionNotice} />
             </div>
         );
     }
@@ -530,8 +581,16 @@ export default function AdminPanel() {
 // ─── Base y Dólar ─────────────────────────────────────────────────────────────
 
 function AdminBase() {
-    const { data, refreshData } = useData();
-    const [dolar, setDolar] = useState(data.config.dollar_value);
+    const { data, loaded, refreshData } = useData();
+    // Se guarda como texto para poder distinguir "vacío" de "0" (Number('') === 0).
+    const [dolar, setDolar] = useState(String(data.config.dollar_value));
+    const [touched, setTouched] = useState(false);
+
+    // Este panel se monta antes de que llegue /api/data: sin esto el campo quedaría con el valor
+    // por defecto (1000) y un "Guardar" pisaría la cotización real.
+    useEffect(() => {
+        if (!touched) setDolar(String(data.config.dollar_value));
+    }, [data.config.dollar_value, touched]);
 
     // Modal state
     const [isModalOpen, setIsModalOpen] = useState(false);
@@ -552,45 +611,48 @@ function AdminBase() {
 
     const handleAddBase = async (value: string): Promise<boolean> => {
         try {
-            const res = await fetch(`${API_URL}/base/${entityType}`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ value })
-            });
-            if (res.ok) {
-                await refreshData();
-                return true;
-            } else {
-                const errData = await res.json().catch(() => ({}));
-                alert(`Error al guardar: ${errData.error || 'Es posible que ya exista.'}`);
-                return false;
-            }
-        } catch (e) { 
-            alert("Error al guardar entidad base. Revisa la consola.");
+            await apiFetch(`/base/${entityType}`, { method: 'POST', body: { value } });
+            await refreshData();
+            return true;
+        } catch (e) {
+            showError(e, 'Error al guardar. Es posible que ya exista.');
             return false;
         }
     };
 
     const saveDolar = async () => {
-        await fetch(`${API_URL}/config`, {
-            method: 'POST',
-            headers: authHeaders(),
-            body: JSON.stringify({ dollar_value: dolar })
-        });
-        await refreshData();
-        alert("Cotización guardada exitosamente en la base de datos.");
+        const nuevo = Number(dolar);
+        const actual = data.config.dollar_value;
+        if (!Number.isFinite(nuevo) || nuevo <= 0) {
+            alert('Ingresá un valor de dólar mayor a 0.');
+            return;
+        }
+        // Un salto grande recalcula TODOS los precios del sitio: pedimos confirmación explícita.
+        const delta = Math.abs(nuevo - actual) / (actual || 1);
+        if (delta > 0.2 && !confirm(
+            `Vas a cambiar el dólar de AR$ ${actual.toLocaleString('es-AR')} a AR$ ${nuevo.toLocaleString('es-AR')} (${Math.round(delta * 100)}% de diferencia).\n\nEsto recalcula TODOS los precios del sitio. ¿Confirmás?`
+        )) return;
+
+        try {
+            await apiFetch('/config', { method: 'POST', body: { dollar_value: nuevo } });
+            await refreshData();
+            setTouched(false);
+            alert('Cotización guardada exitosamente.');
+        } catch (e) {
+            showError(e, 'No se pudo guardar la cotización.');
+        }
     };
 
     const removeBase = async (entity: string, val: any) => {
         try {
-            await fetch(`${API_URL}/base/${entity}`, {
-                method: 'DELETE',
-                headers: authHeaders(),
-                body: JSON.stringify({ value: val })
-            });
+            await apiFetch(`/base/${entity}`, { method: 'DELETE', body: { value: val } });
             await refreshData();
-        } catch (e) { }
+        } catch (e) {
+            showError(e, 'No se pudo eliminar.');
+        }
     };
+
+    const dolarInvalid = dolar === '' || !(Number(dolar) > 0);
 
     return (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
@@ -599,12 +661,19 @@ function AdminBase() {
                     <h3 className="font-semibold text-lg mb-2">Valor Dólar a ARS</h3>
                     <input
                         type="number"
+                        inputMode="decimal"
+                        min="0"
                         value={dolar}
-                        onChange={e => setDolar(Number(e.target.value))}
+                        onChange={e => { setTouched(true); setDolar(e.target.value); }}
                         className="border rounded-lg px-4 py-2 w-full md:w-64"
                     />
+                    {!loaded && <p className="text-xs text-gray-400 mt-1">Cargando cotización actual…</p>}
                 </div>
-                <button onClick={saveDolar} className="bg-black text-white px-6 py-2 rounded-lg font-medium hover:bg-gray-800 flex items-center gap-2">
+                <button
+                    onClick={saveDolar}
+                    disabled={!loaded || dolarInvalid}
+                    className="bg-black text-white px-6 py-2 rounded-lg font-medium hover:bg-gray-800 flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
                     <Save className="w-4 h-4" /> Guardar Dólar
                 </button>
             </div>
@@ -674,22 +743,12 @@ function AdminStock() {
 
     const handleAddQuickModel = async (name: string): Promise<boolean> => {
         try {
-            const res = await fetch(`${API_URL}/base/model`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ value: name })
-            });
-            if (res.ok) {
-                await refreshData();
-                setModel(name);
-                return true;
-            } else {
-                const errData = await res.json().catch(() => ({}));
-                alert(`Error al guardar modelo: ${errData.error || 'Es posible que ya exista.'}`);
-                return false;
-            }
+            await apiFetch('/base/model', { method: 'POST', body: { value: name } });
+            await refreshData();
+            setModel(name);
+            return true;
         } catch (e) {
-            alert("Error al guardar modelo.");
+            showError(e, 'Error al guardar el modelo. Es posible que ya exista.');
             return false;
         }
     };
@@ -701,19 +760,11 @@ function AdminStock() {
         
         try {
             if (editingId) {
-                await fetch(`${API_URL}/stock/${editingId}`, {
-                    method: 'PUT',
-                    headers: authHeaders(),
-                    body: JSON.stringify(payload)
-                });
+                await apiFetch(`/stock/${editingId}`, { method: 'PUT', body: payload });
                 alert("Stock actualizado en la base de datos");
                 setEditingId(null);
             } else {
-                await fetch(`${API_URL}/stock`, {
-                    method: 'POST',
-                    headers: authHeaders(),
-                    body: JSON.stringify(payload)
-                });
+                await apiFetch('/stock', { method: 'POST', body: payload });
                 alert("Stock agregado a la base de datos");
             }
             
@@ -721,7 +772,7 @@ function AdminStock() {
             setPrice(0);
             await refreshData();
         } catch (e) {
-            alert("Error al guardar stock");
+            showError(e, 'Error al guardar stock');
         }
     };
 
@@ -743,11 +794,15 @@ function AdminStock() {
 
     const removeStock = async (id: string) => {
         if (confirm("¿Estás seguro de eliminar este registro de stock?")) {
-            await fetch(`${API_URL}/stock/${id}`, { method: 'DELETE', headers: authHeaders() });
-            if (editingId === id) {
-                cancelEdit();
+            try {
+                await apiFetch(`/stock/${id}`, { method: 'DELETE' });
+                if (editingId === id) {
+                    cancelEdit();
+                }
+                await refreshData();
+            } catch (e) {
+                showError(e, 'No se pudo eliminar el registro.');
             }
-            await refreshData();
         }
     };
 
@@ -951,22 +1006,12 @@ function AdminTradeIn() {
 
     const handleAddQuickModel = async (name: string): Promise<boolean> => {
         try {
-            const res = await fetch(`${API_URL}/base/model`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ value: name })
-            });
-            if (res.ok) {
-                await refreshData();
-                setModel(name);
-                return true;
-            } else {
-                const errData = await res.json().catch(() => ({}));
-                alert(`Error al guardar modelo: ${errData.error || 'Es posible que ya exista.'}`);
-                return false;
-            }
+            await apiFetch('/base/model', { method: 'POST', body: { value: name } });
+            await refreshData();
+            setModel(name);
+            return true;
         } catch (e) {
-            alert("Error al guardar modelo.");
+            showError(e, 'Error al guardar el modelo. Es posible que ya exista.');
             return false;
         }
     };
@@ -978,19 +1023,11 @@ function AdminTradeIn() {
         
         try {
             if (editingId) {
-                await fetch(`${API_URL}/tradein/${editingId}`, {
-                    method: 'PUT',
-                    headers: authHeaders(),
-                    body: JSON.stringify(payload)
-                });
+                await apiFetch(`/tradein/${editingId}`, { method: 'PUT', body: payload });
                 alert("Precio de toma actualizado en la base de datos");
                 setEditingId(null);
             } else {
-                await fetch(`${API_URL}/tradein`, {
-                    method: 'POST',
-                    headers: authHeaders(),
-                    body: JSON.stringify(payload)
-                });
+                await apiFetch('/tradein', { method: 'POST', body: payload });
                 alert("Precio de toma agregado a la base de datos");
             }
             
@@ -998,7 +1035,7 @@ function AdminTradeIn() {
             setPrice(0);
             await refreshData();
         } catch (e) {
-            alert("Error al guardar precio de toma");
+            showError(e, 'Error al guardar precio de toma');
         }
     };
 
@@ -1020,11 +1057,15 @@ function AdminTradeIn() {
 
     const removeTradeIn = async (id: string) => {
         if (confirm("¿Estás seguro de eliminar este precio de toma?")) {
-            await fetch(`${API_URL}/tradein/${id}`, { method: 'DELETE', headers: authHeaders() });
-            if (editingId === id) {
-                cancelEdit();
+            try {
+                await apiFetch(`/tradein/${id}`, { method: 'DELETE' });
+                if (editingId === id) {
+                    cancelEdit();
+                }
+                await refreshData();
+            } catch (e) {
+                showError(e, 'No se pudo eliminar el precio de toma.');
             }
-            await refreshData();
         }
     };
 
@@ -1212,50 +1253,34 @@ function AdminFinance() {
 
     const handleAddCard = async (name: string, baseFactor: number): Promise<boolean> => {
         try {
-            const res = await fetch(`${API_URL}/cards`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ card_name: name, base_factor: baseFactor })
-            });
-            if (res.ok) {
-                await refreshData();
-                return true;
-            } else {
-                const errData = await res.json().catch(() => ({}));
-                alert(`Error al agregar tarjeta: ${errData.error || 'Es posible que ya exista.'}`);
-                return false;
-            }
+            await apiFetch('/cards', { method: 'POST', body: { card_name: name, base_factor: baseFactor } });
+            await refreshData();
+            return true;
         } catch (e) {
-            alert("Error al agregar tarjeta.");
+            showError(e, 'Error al agregar la tarjeta. Es posible que ya exista.');
             return false;
         }
     };
 
     const handleAddPlan = async (cardName: string, installments: number, surchargeCoefficient: number): Promise<boolean> => {
         try {
-            const res = await fetch(`${API_URL}/plans`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ card_name: cardName, installments, surcharge_coefficient: surchargeCoefficient })
-            });
-            if (res.ok) {
-                await refreshData();
-                return true;
-            } else {
-                const errData = await res.json().catch(() => ({}));
-                alert(`Error al agregar plan: ${errData.error || 'Es posible que ya exista.'}`);
-                return false;
-            }
+            await apiFetch('/plans', { method: 'POST', body: { card_name: cardName, installments, surcharge_coefficient: surchargeCoefficient } });
+            await refreshData();
+            return true;
         } catch (e) {
-            alert("Error al agregar plan.");
+            showError(e, 'Error al agregar el plan. Es posible que ya exista.');
             return false;
         }
     };
 
     const removeCard = async (card_name: string) => {
         if (confirm(`¿Estás seguro de eliminar la tarjeta ${card_name}?`)) {
-            await fetch(`${API_URL}/cards/${card_name}`, { method: 'DELETE', headers: authHeaders() });
-            await refreshData();
+            try {
+                await apiFetch(`/cards/${encodeURIComponent(card_name)}`, { method: 'DELETE' });
+                await refreshData();
+            } catch (e) {
+                showError(e, 'No se pudo eliminar la tarjeta.');
+            }
         }
     };
 
@@ -1263,22 +1288,23 @@ function AdminFinance() {
         const val = prompt(`Nuevo coeficiente base para ${card_name}`, String(currentFactor));
         if (val === null) return;
         const newFactor = Number(val);
-        if (isNaN(newFactor)) return alert("Debe ser un número válido");
+        if (val.trim() === '' || !Number.isFinite(newFactor) || newFactor <= 0) return alert("Debe ser un número válido mayor a 0");
 
         try {
-            await fetch(`${API_URL}/cards/${card_name}`, {
-                method: 'PUT',
-                headers: authHeaders(),
-                body: JSON.stringify({ base_factor: newFactor })
-            });
+            await apiFetch(`/cards/${encodeURIComponent(card_name)}`, { method: 'PUT', body: { base_factor: newFactor } });
             await refreshData();
-        } catch (e) { alert("Error al actualizar"); }
+            alert("Coeficiente actualizado.");
+        } catch (e) { showError(e, "No se pudo actualizar el coeficiente."); }
     };
 
     const removePlan = async (id: string) => {
         if (confirm("¿Estás seguro de eliminar este plan?")) {
-            await fetch(`${API_URL}/plans/${id}`, { method: 'DELETE', headers: authHeaders() });
-            await refreshData();
+            try {
+                await apiFetch(`/plans/${id}`, { method: 'DELETE' });
+                await refreshData();
+            } catch (e) {
+                showError(e, 'No se pudo eliminar el plan.');
+            }
         }
     };
 
@@ -1286,16 +1312,13 @@ function AdminFinance() {
         const val = prompt(`Nuevo coeficiente para el plan de ${currentInst} cuotas`, String(currentCoeff));
         if (val === null) return;
         const newCoeff = Number(val);
-        if (isNaN(newCoeff)) return alert("Debe ser un número válido");
+        if (val.trim() === '' || !Number.isFinite(newCoeff) || newCoeff <= 0) return alert("Debe ser un número válido mayor a 0");
 
         try {
-            await fetch(`${API_URL}/plans/${id}`, {
-                method: 'PUT',
-                headers: authHeaders(),
-                body: JSON.stringify({ installments: currentInst, surcharge_coefficient: newCoeff })
-            });
+            await apiFetch(`/plans/${id}`, { method: 'PUT', body: { installments: currentInst, surcharge_coefficient: newCoeff } });
             await refreshData();
-        } catch (e) { alert("Error al actualizar"); }
+            alert("Coeficiente actualizado.");
+        } catch (e) { showError(e, "No se pudo actualizar el coeficiente."); }
     };
 
     return (
@@ -1375,14 +1398,15 @@ function AdminGallery() {
         if (file) formData.append('image', file);
         formData.append('description', description);
 
-        const url = editingId ? `${API_URL}/gallery/${editingId}` : `${API_URL}/gallery`;
+        const path = editingId ? `/gallery/${editingId}` : '/gallery';
         const method = editingId ? 'PUT' : 'POST';
 
-        await fetch(url, {
-            method,
-            headers: { 'Authorization': `Bearer ${getToken()}` },
-            body: formData
-        });
+        try {
+            await apiFetch(path, { method, body: formData });
+        } catch (e) {
+            showError(e, 'No se pudo guardar la imagen.');
+            return;
+        }
         await refreshData();
         setFile(null);
         setDescription("");
@@ -1399,8 +1423,12 @@ function AdminGallery() {
 
     const handleDelete = async (id: string) => {
         if (!confirm("¿Eliminar imagen?")) return;
-        await fetch(`${API_URL}/gallery/${id}`, { method: 'DELETE', headers: authHeaders() });
-        await refreshData();
+        try {
+            await apiFetch(`/gallery/${id}`, { method: 'DELETE' });
+            await refreshData();
+        } catch (e) {
+            showError(e, 'No se pudo eliminar la imagen.');
+        }
     };
 
     return (
@@ -1475,11 +1503,10 @@ function AdminUsers({ currentUsername }: { currentUsername: string }) {
 
     const fetchUsers = async () => {
         try {
-            const res = await fetch(`${API_URL}/users`, { headers: authHeaders() });
-            if (res.ok) {
-                setUsers(await res.json());
-            }
-        } catch (e) { }
+            setUsers(await apiFetch('/users'));
+        } catch (e) {
+            showError(e, 'No se pudo cargar la lista de usuarios.');
+        }
     };
 
     useEffect(() => {
@@ -1493,22 +1520,16 @@ function AdminUsers({ currentUsername }: { currentUsername: string }) {
         setError('');
         setSuccess('');
         try {
-            const res = await fetch(`${API_URL}/users`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ username: newUsername.trim(), password: newPassword })
-            });
-            const data = await res.json();
-            if (!res.ok) {
-                setError(data.error || 'Error al crear usuario');
-            } else {
-                setSuccess(`Usuario "${data.username}" creado exitosamente.`);
-                setNewUsername('');
-                setNewPassword('');
-                await fetchUsers();
-            }
+            const data = await apiFetch('/users', { method: 'POST', body: { username: newUsername.trim(), password: newPassword } });
+            setSuccess(`Usuario "${data.username}" creado exitosamente.`);
+            setNewUsername('');
+            setNewPassword('');
+            await fetchUsers();
         } catch (e) {
-            setError('Error de conexión');
+            // Si la sesión terminó, el panel ya pasa al login: no mostramos un error suelto.
+            if (!(e instanceof ApiError && e.sessionEnded)) {
+                setError(e instanceof Error ? e.message : 'Error al crear usuario');
+            }
         } finally {
             setLoading(false);
         }
@@ -1521,9 +1542,11 @@ function AdminUsers({ currentUsername }: { currentUsername: string }) {
         }
         if (!confirm(`¿Eliminar el usuario "${username}"? Esta acción no se puede deshacer.`)) return;
         try {
-            await fetch(`${API_URL}/users/${id}`, { method: 'DELETE', headers: authHeaders() });
+            await apiFetch(`/users/${id}`, { method: 'DELETE' });
             await fetchUsers();
-        } catch (e) { }
+        } catch (e) {
+            showError(e, 'No se pudo eliminar el usuario.');
+        }
     };
 
     return (
@@ -1633,16 +1656,12 @@ function AdminPropuesta() {
     const handleSave = async () => {
         setSaving(true);
         try {
-            await fetch(`${API_URL}/feature-cards`, {
-                method: 'POST',
-                headers: authHeaders(),
-                body: JSON.stringify({ feature_cards: cards })
-            });
+            await apiFetch('/feature-cards', { method: 'POST', body: { feature_cards: cards } });
             await refreshData();
             setSaved(true);
             setTimeout(() => setSaved(false), 3000);
         } catch (e) {
-            alert('Error al guardar');
+            showError(e, 'Error al guardar');
         } finally {
             setSaving(false);
         }
@@ -1731,17 +1750,13 @@ function AdminStoreGallery() {
         formData.append('image', file);
         if (description) formData.append('description', description);
         try {
-            await fetch(`${API_URL}/store-gallery`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${localStorage.getItem('apple_admin_token')}` },
-                body: formData
-            });
+            await apiFetch('/store-gallery', { method: 'POST', body: formData });
             setDescription('');
             setFile(null);
             if (fileRef.current) fileRef.current.value = '';
             await refreshData();
-        } catch {
-            alert('Error al subir la imagen.');
+        } catch (e) {
+            showError(e, 'Error al subir la imagen.');
         } finally {
             setUploading(false);
         }
@@ -1749,11 +1764,12 @@ function AdminStoreGallery() {
 
     const handleDelete = async (id: string) => {
         if (!confirm('¿Eliminar esta foto del local?')) return;
-        await fetch(`${API_URL}/store-gallery/${id}`, {
-            method: 'DELETE',
-            headers: authHeaders()
-        });
-        await refreshData();
+        try {
+            await apiFetch(`/store-gallery/${id}`, { method: 'DELETE' });
+            await refreshData();
+        } catch (e) {
+            showError(e, 'No se pudo eliminar la foto.');
+        }
     };
 
     return (
@@ -1837,19 +1853,15 @@ function AdminLandingIphones() {
         formData.append('order_index', String(order));
 
         try {
-            await fetch(`${API_URL}/landing-iphones`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${localStorage.getItem('apple_admin_token')}` },
-                body: formData
-            });
+            await apiFetch('/landing-iphones', { method: 'POST', body: formData });
             setName('');
             setPrice('');
             setOrder(0);
             setFile(null);
             if (fileRef.current) fileRef.current.value = '';
             await refreshData();
-        } catch {
-            alert('Error al guardar el iPhone.');
+        } catch (e) {
+            showError(e, 'Error al guardar el iPhone.');
         } finally {
             setLoading(false);
         }
@@ -1857,11 +1869,12 @@ function AdminLandingIphones() {
 
     const handleDelete = async (id: string) => {
         if (!confirm('¿Eliminar este iPhone de la landing?')) return;
-        await fetch(`${API_URL}/landing-iphones/${id}`, {
-            method: 'DELETE',
-            headers: authHeaders()
-        });
-        await refreshData();
+        try {
+            await apiFetch(`/landing-iphones/${id}`, { method: 'DELETE' });
+            await refreshData();
+        } catch (e) {
+            showError(e, 'No se pudo eliminar el iPhone.');
+        }
     };
 
     return (
@@ -1977,19 +1990,15 @@ function AdminLandingAccessories() {
         formData.append('order_index', String(order));
 
         try {
-            await fetch(`${API_URL}/landing-accessories`, {
-                method: 'POST',
-                headers: { Authorization: `Bearer ${localStorage.getItem('apple_admin_token')}` },
-                body: formData
-            });
+            await apiFetch('/landing-accessories', { method: 'POST', body: formData });
             setName('');
             setPrice('');
             setOrder(0);
             setFile(null);
             if (fileRef.current) fileRef.current.value = '';
             await refreshData();
-        } catch {
-            alert('Error al guardar el accesorio.');
+        } catch (e) {
+            showError(e, 'Error al guardar el accesorio.');
         } finally {
             setLoading(false);
         }
@@ -1997,11 +2006,12 @@ function AdminLandingAccessories() {
 
     const handleDelete = async (id: string) => {
         if (!confirm('¿Eliminar este accesorio de la landing?')) return;
-        await fetch(`${API_URL}/landing-accessories/${id}`, {
-            method: 'DELETE',
-            headers: authHeaders()
-        });
-        await refreshData();
+        try {
+            await apiFetch(`/landing-accessories/${id}`, { method: 'DELETE' });
+            await refreshData();
+        } catch (e) {
+            showError(e, 'No se pudo eliminar el accesorio.');
+        }
     };
 
     return (
@@ -2110,22 +2120,18 @@ function AdminFaqs() {
         if (!question || !answer) return;
         setLoading(true);
         const payload = { question, answer, order: Number(order) };
-        const url = editingId ? `${API_URL}/faqs/${editingId}` : `${API_URL}/faqs`;
+        const path = editingId ? `/faqs/${editingId}` : '/faqs';
         const method = editingId ? 'PUT' : 'POST';
 
         try {
-            await fetch(url, {
-                method,
-                headers: authHeaders(),
-                body: JSON.stringify(payload)
-            });
+            await apiFetch(path, { method, body: payload });
             setQuestion('');
             setAnswer('');
             setOrder(0);
             setEditingId(null);
             await refreshData();
-        } catch {
-            alert('Error al guardar la FAQ.');
+        } catch (e) {
+            showError(e, 'Error al guardar la FAQ.');
         } finally {
             setLoading(false);
         }
@@ -2140,11 +2146,12 @@ function AdminFaqs() {
 
     const handleDelete = async (id: string) => {
         if (!confirm('¿Eliminar esta pregunta frecuente?')) return;
-        await fetch(`${API_URL}/faqs/${id}`, {
-            method: 'DELETE',
-            headers: authHeaders()
-        });
-        await refreshData();
+        try {
+            await apiFetch(`/faqs/${id}`, { method: 'DELETE' });
+            await refreshData();
+        } catch (e) {
+            showError(e, 'No se pudo eliminar la pregunta.');
+        }
     };
 
     return (

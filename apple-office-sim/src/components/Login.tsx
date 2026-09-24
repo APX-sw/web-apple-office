@@ -3,11 +3,13 @@ import { Lock } from 'lucide-react';
 
 interface LoginProps {
     onLogin: (token: string, username: string) => void;
+    /** Aviso a mostrar arriba del formulario (ej. "Tu sesión expiró"). */
+    notice?: string | null;
 }
 
 const API_URL = (import.meta.env.VITE_API_URL || 'http://localhost:3000') + '/api';
 
-export default function Login({ onLogin }: LoginProps) {
+export default function Login({ onLogin, notice }: LoginProps) {
     const [username, setUsername] = useState('');
     const [password, setPassword] = useState('');
     const [error, setError] = useState('');
@@ -49,6 +51,11 @@ export default function Login({ onLogin }: LoginProps) {
                         Ingresa tus credenciales de administrador
                     </p>
                 </div>
+                {notice && (
+                    <div role="alert" className="bg-amber-50 border border-amber-200 text-amber-900 text-sm font-medium text-center px-4 py-3 rounded-xl">
+                        {notice}
+                    </div>
+                )}
                 <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
                     <div className="rounded-md shadow-sm space-y-4">
                         <div>
