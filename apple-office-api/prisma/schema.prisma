@@ -36,6 +36,19 @@ model BaseBattery {
   @@map("basebattery")
 }
 
+/// ⚠️ TABLA LEGACY. Ya no la usa el código, pero SIGUE EXISTIENDO EN PRODUCCIÓN (con datos).
+/// NO la borres de este archivo: si no está acá, un `prisma db push` / `prisma migrate` intentaría
+/// hacer DROP TABLE accessory en la base real. Definición idéntica a la original (commit 7ed098f).
+/// Regla general: nunca correr `prisma db push`, `migrate dev/reset` ni los scripts populate_*/seed
+/// contra producción. `npx prisma generate` sí es seguro (no toca la base).
+model Accessory {
+  id        String @id @default(uuid())
+  name      String
+  price_usd Float
+
+  @@map("accessory")
+}
+
 model IphoneStock {
   id             String   @id @default(uuid())
   model          String
