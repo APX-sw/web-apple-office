@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, lazy, Suspense } from 'react';
 import { DataProvider } from './context/DataContext';
 import LandingPage from './components/LandingPage';
-import AdminPanel from './components/AdminPanel';
+// El panel de administración es grande y los clientes nunca lo abren: se descarga solo al entrar.
+const AdminPanel = lazy(() => import('./components/AdminPanel'));
 
 function MainApp() {
   const [view, setView] = useState<'simulation' | 'admin'>('simulation');
@@ -38,7 +39,9 @@ function MainApp() {
             </div>
           </header>
 
-          <AdminPanel />
+          <Suspense fallback={<div className="py-24 text-center text-gray-400 font-medium">Cargando panel…</div>}>
+            <AdminPanel />
+          </Suspense>
         </>
       )}
     </div>

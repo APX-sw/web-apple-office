@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { useData } from '../context/DataContext';
 import SimulationPanel from './SimulationPanel';
+import { useMediaQuery } from '../hooks/useMediaQuery';
+import { useBodyScrollLock } from '../hooks/useBodyScrollLock';
 import { Package, ShieldCheck, RefreshCw, MessageCircleHeart, MapPin, Clock, ArrowRight, Menu, X, Settings, Smartphone, Watch, Camera, HelpCircle } from 'lucide-react';
 
 const ICON_MAP: Record<string, React.ReactNode> = {
@@ -12,10 +14,50 @@ const ICON_MAP: Record<string, React.ReactNode> = {
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
+/**
+ * Fondo del hero. La imagen fija SIEMPRE está: es lo que se ve al instante (adiós pantalla negra).
+ * El video solo se monta en pantallas grandes: en el celular nunca se descarga, así el cliente que
+ * llega desde un link de WhatsApp no gasta datos ni espera. Se renderiza condicionalmente (no se
+ * oculta con CSS) porque un <video> oculto igual descarga su archivo.
+ */
+function HeroBackground() {
+    const isDesktop = useMediaQuery('(min-width: 1024px)');
+    const reduceMotion = useMediaQuery('(prefers-reduced-motion: reduce)');
+    const saveData = (navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData === true;
+    const playVideo = isDesktop && !reduceMotion && !saveData;
+    const [videoReady, setVideoReady] = useState(false);
+
+    return (
+        <>
+            <img
+                src="/hero-poster.jpg"
+                alt=""
+                aria-hidden="true"
+                fetchPriority="high"
+                decoding="async"
+                className="absolute inset-0 w-full h-full object-cover opacity-60"
+            />
+            {playVideo && (
+                <video
+                    src="/video-apple-office.mp4"
+                    autoPlay
+                    loop
+                    muted
+                    playsInline
+                    aria-hidden="true"
+                    onCanPlay={() => setVideoReady(true)}
+                    className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-1000 ${videoReady ? 'opacity-60' : 'opacity-0'}`}
+                />
+            )}
+        </>
+    );
+}
+
 export default function LandingPage({ setView }: { setView: (v: 'simulation' | 'admin') => void }) {
     const { data } = useData();
     const [scrolled, setScrolled] = useState(false);
     const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+    useBodyScrollLock(mobileMenuOpen);
 
     useEffect(() => {
         const handleScroll = () => setScrolled(window.scrollY > 20);
@@ -66,7 +108,9 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
 
             {/* Mobile Menu Dropdown */}
             {mobileMenuOpen && (
-                <div className={`fixed inset-0 ${scrolled ? 'top-[65px]' : 'top-[75px]'} bg-black/95 backdrop-blur-3xl text-white z-40 p-8 flex flex-col gap-6 font-bold text-xl md:hidden shadow-xl animate-in fade-in slide-in-from-top-10`}>
+                // pt-24 deja libre la barra superior (que queda encima, z-50); overflow-y-auto porque en pantallas
+                // bajas la lista no entra completa.
+                <div className="fixed inset-0 bg-black/95 backdrop-blur-3xl text-white z-40 px-8 pb-8 pt-24 overflow-y-auto overscroll-contain flex flex-col gap-1 font-bold text-xl md:hidden shadow-xl animate-in fade-in slide-in-from-top-10">
                     <button onClick={() => { scrollTo('propuesta'); setMobileMenuOpen(false); }} className="flex items-center gap-3 text-left py-4 border-b border-gray-800 hover:text-emerald-400"><ShieldCheck className="text-emerald-500" /> Nuestra Garantía</button>
                     <button onClick={() => { scrollTo('iphones'); setMobileMenuOpen(false); }} className="flex items-center gap-3 text-left py-4 border-b border-gray-800 hover:text-emerald-400"><Smartphone className="text-emerald-500" /> Iphones</button>
                     <button onClick={() => { scrollTo('accesorios'); setMobileMenuOpen(false); }} className="flex items-center gap-3 text-left py-4 border-b border-gray-800 hover:text-emerald-400"><Watch className="text-emerald-500" /> Accesorios</button>
@@ -81,20 +125,13 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
             )}
 
             {/* HERO SECTION */}
-            <section className="relative w-full min-h-screen flex flex-col items-center justify-center pt-20 bg-black text-white px-4 border-b border-gray-900 border-opacity-50 overflow-hidden">
+            <section className="relative w-full min-h-screen supports-[height:100svh]:min-h-[100svh] flex flex-col items-center justify-center pt-20 bg-black text-white px-4 border-b border-gray-900 border-opacity-50 overflow-hidden">
                 {/* Botanical highlight */}
                 <div className="absolute top-1/4 right-0 w-[500px] h-[500px] bg-emerald-800/20 rounded-full blur-[100px] pointer-events-none z-0 animate-pulse" style={{ animationDuration: '4s' }}></div>
 
                 {/* Video Background */}
                 <div className="absolute inset-0 w-full h-full z-0 pointer-events-none overflow-hidden">
-                    <video
-                        src="/video-apple-office.MOV"
-                        autoPlay
-                        loop
-                        muted
-                        playsInline
-                        className="absolute inset-0 w-full h-full object-cover opacity-60 animate-in fade-in duration-[2000ms]"
-                    />
+                    <HeroBackground />
                     {/* Gradients to ensure text readability and blend with the black theme */}
                     <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black pointer-events-none"></div>
                     <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_transparent_20%,_black_100%)] opacity-90 pointer-events-none"></div>
@@ -162,13 +199,15 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
                     <div className="relative group">
                         <div className="flex gap-6 overflow-x-auto pb-12 snap-x no-scrollbar -mx-4 px-4 scroll-smooth">
                             {(data.landingIphones ?? []).map((iphone, i) => (
-                                <div key={iphone.id} className="min-w-[320px] md:min-w-[420px] snap-start h-full pb-4">
+                                <div key={iphone.id} className="min-w-[78vw] sm:min-w-[320px] md:min-w-[420px] snap-start h-full pb-4">
                                     <RevealOnScroll delay={i * 100} className="h-full">
                                         <div className="bg-[#f5f5f7] rounded-[2.5rem] p-8 md:p-12 flex flex-col items-center text-center group/card transition-all duration-500 hover:shadow-[0_20px_60px_rgba(0,0,0,0.08)] h-full">
                                             <div className="h-[250px] md:h-[320px] mb-8 relative flex items-center justify-center w-full mt-4">
                                                 <img 
                                                     src={`${BASE_URL}${iphone.image_url}`} 
                                                     alt={iphone.name} 
+                                                    loading="lazy"
+                                                    decoding="async"
                                                     className="max-w-full max-h-full object-contain group-hover/card:scale-110 transition-transform duration-700"
                                                 />
                                             </div>
@@ -207,13 +246,15 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
                     <div className="relative group">
                         <div className="flex gap-6 overflow-x-auto pb-12 snap-x no-scrollbar -mx-4 px-4 scroll-smooth">
                             {(data.landingAccessories ?? []).map((accessory, i) => (
-                                <div key={accessory.id} className="min-w-[320px] md:min-w-[420px] snap-start h-full pb-4">
+                                <div key={accessory.id} className="min-w-[78vw] sm:min-w-[320px] md:min-w-[420px] snap-start h-full pb-4">
                                     <RevealOnScroll delay={i * 100} className="h-full">
                                         <div className="bg-white rounded-[2.5rem] p-8 md:p-12 flex flex-col items-center text-center group/card transition-all duration-500 hover:shadow-[0_20px_60px_rgba(0,0,0,0.08)] h-full border border-gray-100">
                                             <div className="h-[250px] md:h-[320px] mb-8 relative flex items-center justify-center w-full mt-4">
                                                 <img 
                                                     src={`${BASE_URL}${accessory.image_url}`} 
                                                     alt={accessory.name} 
+                                                    loading="lazy"
+                                                    decoding="async"
                                                     className="max-w-full max-h-full object-contain group-hover/card:scale-110 transition-transform duration-700 mix-blend-multiply"
                                                 />
                                             </div>
@@ -294,9 +335,11 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
                                                         className="w-full h-full object-cover group-hover/card:scale-105 transition-transform duration-500 opacity-90 group-hover/card:opacity-100"
                                                         alt={description || "Cliente Apple Office"}
                                                         draggable={false}
+                                                        loading="lazy"
+                                                        decoding="async"
                                                     />
                                                     {description && (
-                                                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 translate-y-4 group-hover/card:translate-y-0 opacity-0 group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
+                                                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 md:translate-y-4 md:group-hover/card:translate-y-0 md:opacity-0 md:group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
                                                             <p className="text-white font-bold text-sm md:text-lg leading-snug">
                                                                 {description}
                                                             </p>
@@ -330,9 +373,11 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
                                                         className="w-full h-full object-cover group-hover/card:scale-105 transition-transform duration-500 opacity-90 group-hover/card:opacity-100"
                                                         alt={description || "Cliente Apple Office"}
                                                         draggable={false}
+                                                        loading="lazy"
+                                                        decoding="async"
                                                     />
                                                     {description && (
-                                                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 translate-y-4 group-hover/card:translate-y-0 opacity-0 group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
+                                                        <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 md:translate-y-4 md:group-hover/card:translate-y-0 md:opacity-0 md:group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
                                                             <p className="text-white font-bold text-sm md:text-lg leading-snug">
                                                                 {description}
                                                             </p>
@@ -382,9 +427,11 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
                                                     className="w-full h-full object-cover group-hover/card:scale-105 transition-transform duration-500 opacity-80 group-hover/card:opacity-100"
                                                     alt={g.description || 'Apple Office Local'}
                                                     draggable={false}
+                                                        loading="lazy"
+                                                        decoding="async"
                                                 />
                                                 {g.description && (
-                                                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 translate-y-4 group-hover/card:translate-y-0 opacity-0 group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
+                                                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 md:translate-y-4 md:group-hover/card:translate-y-0 md:opacity-0 md:group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
                                                         <p className="text-white font-bold text-sm md:text-lg leading-snug">{g.description}</p>
                                                     </div>
                                                 )}
@@ -406,9 +453,11 @@ export default function LandingPage({ setView }: { setView: (v: 'simulation' | '
                                                     className="w-full h-full object-cover group-hover/card:scale-105 transition-transform duration-500 opacity-80 group-hover/card:opacity-100"
                                                     alt={g.description || 'Apple Office Local'}
                                                     draggable={false}
+                                                        loading="lazy"
+                                                        decoding="async"
                                                 />
                                                 {g.description && (
-                                                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 translate-y-4 group-hover/card:translate-y-0 opacity-0 group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
+                                                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent flex items-end p-6 md:p-8 md:translate-y-4 md:group-hover/card:translate-y-0 md:opacity-0 md:group-hover/card:opacity-100 transition-all duration-300 pointer-events-none h-1/2">
                                                         <p className="text-white font-bold text-sm md:text-lg leading-snug">{g.description}</p>
                                                     </div>
                                                 )}
@@ -565,6 +614,11 @@ function RevealOnScroll({ children, delay = 0, className = "" }: { children: Rea
     const ref = React.useRef<HTMLDivElement>(null);
 
     useEffect(() => {
+        // En un navegador sin IntersectionObserver el contenido quedaría invisible para siempre.
+        if (!('IntersectionObserver' in window)) {
+            const t = setTimeout(() => setIsVisible(true), 0);
+            return () => clearTimeout(t);
+        }
         const observer = new IntersectionObserver(
             ([entry]) => {
                 if (entry.isIntersecting) {

@@ -40,18 +40,23 @@
   }
 }
 
-@keyframes marquee {
-  0% {
-    transform: translateX(0%);
-  }
-
-  100% {
-    transform: translateX(-100%);
+/* Las animaciones marquee (velocidad incluida) se definen en tailwind.config.js: acá estaban
+   duplicadas con otra duración y las dos galerías corrían a velocidades que no coincidían. */
+@media (prefers-reduced-motion: reduce) {
+  .animate-marquee,
+  .animate-marquee-reverse {
+    animation: none;
   }
 }
 
-.animate-marquee {
-  animation: marquee 45s linear infinite;
+/* Carruseles: en pantallas táctiles no hace falta la barra (se ve la tarjeta siguiente asomando). */
+@media (pointer: coarse) {
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 /* Custom Scrollbar for Premium Look */
